@@ -1,4 +1,6 @@
-# app.py
+﻿from pathlib import Path
+from logging import getLogger
+from logging.handlers import RotatingFileHandler
 import logging
 import os
 from typing import Any
@@ -15,9 +17,29 @@ from task_sync_service import (
     process_single_record,
 )
 
+def configure_logging() -> None:
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / "app.log"
 
-logging.basicConfig(level=logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+    file_handler = RotatingFileHandler(log_file, maxBytes=1_048_576, backupCount=5, encoding="utf-8")
+    file_handler.setFormatter(formatter)
 
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    root = getLogger()
+    root.setLevel(logging.INFO)
+
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    root.addHandler(console_handler)
+    root.addHandler(file_handler)
+
+
+configure_logging()
 
 app = Flask(__name__)
 
@@ -27,34 +49,27 @@ CORS(app, resources={
         "origins": ["http://localhost:5173", "http://127.0.0.1:5173"],
         "methods": ["POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "X-Requested-With", "Accept"],
-        "max_age": 86400,  # cache preflight for 1 day
+        "max_age": 86400,
     }
 })
 
+
 @app.route("/api/endpoint", methods=["POST", "OPTIONS"])
 def handle_summary():
-    # 为什么要检查 OPTIONS 方法？
-	# 1.	跨域请求（CORS）预检
-	# •	当浏览器发起跨域请求时，首先会发送一个 OPTIONS 请求，这叫做 预检请求（Preflight request）。
-	# •	预检请求的目的是检查服务器是否允许跨域请求，浏览器会先发 OPTIONS 请求来询问服务器是否支持跨域操作，然后再决定是否发送真正的 POST 或 GET 请求。
-	# 2.	CORS 头部检查
-	# •	OPTIONS 请求通常不会携带业务数据，只是用来检查服务器是否接受跨域请求。
-	# •	所以在你的 Flask 应用中，当接收到 OPTIONS 请求时，我们通常返回一个 204 No Content 响应，表示预检成功，允许跨域请求。
-	# 3.	为什么处理 OPTIONS 请求？
-	# •	如果不处理 OPTIONS 请求，浏览器在发起实际请求时会被拦截，显示 CORS 错误。因此，我们需要显式处理 OPTIONS 请求并返回适当的响应头，告诉浏览器接下来的 POST 请求是允许的。
-
+    # Respond to OPTIONS preflight so browsers can make the real request.
     if request.method == "OPTIONS":
         return ("", 204)
-    data = request.get_json()  # Waits for the request to arrive from the front-end and parses it into a Python dictionary. get_json() 是 Flask 框架提供的一个方法，用来从 HTTP 请求的 请求体（body）中提取 JSON 数据，并将其转换为 Python 对象（通常是字典 dict）。
-    if not data or "summaryText" not in data:
-        return jsonify(status="error", message="Missing summaryText"), 400  # `jsonify` can accept either a dictionary or multiple key-value pairs as parameters.
-    
+
+    data = request.get_json(silent=True) or {}
+    if "summaryText" not in data:
+        return jsonify(status="error", message="Missing summaryText"), 400
+
     summary = data["summaryText"].strip()
     if not summary:
         return jsonify(status="error", message="Empty summaryText"), 400
-    # 严格按 payload 中的布尔 True 判断是否发送至对应群
-    pd_flag = (data.get("pd") is True)
-    ops_flag = (data.get("ops") is True)
+
+    pd_flag = data.get("pd") is True
+    ops_flag = data.get("ops") is True
 
     pd_chat = os.getenv("PD_CHAT_ID")
     ops_chat = os.getenv("OPS_CHAT_ID")
@@ -62,23 +77,23 @@ def handle_summary():
     targets = []
     if pd_flag:
         if not pd_chat:
-            return jsonify(status="error", message="缺少 PD_CHAT_ID 环境变量"), 500
+            return jsonify(status="error", message="Missing PD_CHAT_ID environment variable"), 500
         targets.append(pd_chat)
     if ops_flag:
         if not ops_chat:
-            return jsonify(status="error", message="缺少 OPS_CHAT_ID 环境变量"), 500
+            return jsonify(status="error", message="Missing OPS_CHAT_ID environment variable"), 500
         targets.append(ops_chat)
 
     if not targets:
-        # 两个开关均为 False，则不发送
-        return jsonify(status="success", message="未发送：pd/ops 均为 false", targets=[])
+        # Both toggles disabled -> nothing to send.
+        return jsonify(status="success", message="Not sent: pd/ops flags are false", targets=[])
 
     try:
         for chat_id in targets:
             send_post_from_summary_text(summary, receive_id=chat_id, receive_id_type="chat_id")
-        return jsonify(status="success", message="已发送到目标群", targets=targets)
-    except Exception as e:
-        return jsonify(status="error", message=str(e)), 500
+        return jsonify(status="success", message="Sent to targets", targets=targets)
+    except Exception as exc:
+        return jsonify(status="error", message=str(exc)), 500
 
 
 @app.route("/api/task-sync", methods=["POST", "OPTIONS"])
@@ -100,7 +115,7 @@ def trigger_task_sync():
 
     timeout_value = data.get("timeout", 70)
 
-    # 单条记录调用
+    # Handle a single record call.
     if records is None:
         if payload is None:
             if not isinstance(record_id, str) or not record_id.strip():
@@ -121,7 +136,7 @@ def trigger_task_sync():
             return jsonify(result), 202
         return jsonify(result), 502
 
-    # 批量处理多条记录
+    # Batch process multiple records.
     if not isinstance(records, list) or not records:
         return jsonify(status="error", message="records must be a non-empty list"), 400
 

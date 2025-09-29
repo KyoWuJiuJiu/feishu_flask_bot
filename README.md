@@ -87,3 +87,10 @@ Additional utilities (`test.py`, `test_post.py`) provide quick manual experiment
 
 ## License
 Specify your project license here (e.g., MIT, Apache-2.0) if you plan to share the code. Update this section accordingly.
+## 部署环境接口
+
+- 发送消息：`http://122.227.179.126:9876/api/endpoint`
+- 同步任务触发：`http://122.227.179.126:9876/api/task-sync`
+- 同步任务状态查询：`http://122.227.179.126:9876/api/task-sync/status/<job_id>`
+
+以上为 windows 服务器 Waitress 实例直接对外暴露的地址。如后续接入 NGINX/IIS 反向代理，请根据新域名/端口更新。
