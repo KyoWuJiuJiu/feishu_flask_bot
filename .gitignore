@@ -1,0 +1,23 @@
+﻿# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Logs
+logs/
+*.log
+
+# Environment files
+.env
+.env.*
+
+# OS artifacts
+Thumbs.db
+.DS_Store
+
+# Misc
+*.swp
+*.swo
+
