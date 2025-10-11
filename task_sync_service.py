@@ -190,8 +190,20 @@ def enqueue_batch_job(
 
     with _jobs_lock:
         _jobs[job_id] = job_data
+    logger.info(
+        "enqueue_batch_job %s: %d record(s), timeout=%s",
+        job_id,
+        len(records),
+        timeout,
+    )
 
     def worker():
+        logger.info(
+            "job %s worker started on thread %s (records=%d)",
+            job_id,
+            threading.current_thread().name,
+            len(records),
+        )
         results: List[Dict[str, Any]] = []
         success_count = 0
         accepted_count = 0
@@ -236,8 +248,31 @@ def enqueue_batch_job(
                     "completedAt": time.time(),
                 }
             )
+        logger.info(
+            "job %s worker finished: total=%d success=%d accepted=%d error=%d status=%s",
+            job_id,
+            total,
+            success_count,
+            accepted_count,
+            error_count,
+            overall,
+        )
 
-    thread = threading.Thread(target=worker, daemon=True)
+    def worker_wrapper():
+        try:
+            worker()
+        except Exception:  # noqa: BLE001
+            logger.exception("job %s worker crashed", job_id)
+            with _jobs_lock:
+                job_data.update(
+                    {
+                        "status": "error",
+                        "results": [],
+                        "completedAt": time.time(),
+                    }
+                )
+
+    thread = threading.Thread(target=worker_wrapper, daemon=True)
     thread.start()
 
     return job_id

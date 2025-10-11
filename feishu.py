@@ -202,20 +202,24 @@ def send_post_zh_cn(zh_cn: dict, *, receive_id: str | None = None, receive_id_ty
     return _feishu_post(url, headers, params, payload)
 
 
-def _make_task_line(user_id: str, text: str) -> list[dict]:
-    """一行任务：☐ + @user + 文本（斜体+加粗）。user_id 必须是可 @ 的 id。"""
-    line = [
-        {"tag": "text", "text": "☐   ", "style": ["italic"]},
-        {"tag": "at", "user_id": user_id},
-        {"tag": "text", "text": (" " + text) if text else "", "style": ["italic", "bold"]},
-    ]
+def _make_task_line(user_ids: list[str], text: str) -> list[dict]:
+    """一行任务：☐ + 多个 @user + 文本（斜体+加粗）。user_ids 为可 @ 的 open_id 列表。"""
+    line: list[dict] = [{"tag": "text", "text": "☐   ", "style": ["italic"]}]
+    cleaned_ids = [uid for uid in (user_ids or []) if isinstance(uid, str) and uid.strip()]
+    for idx, uid in enumerate(cleaned_ids):
+        line.append({"tag": "at", "user_id": uid})
+        if idx < len(cleaned_ids) - 1:
+            line.append({"tag": "text", "text": " ", "style": ["italic"]})
+    if text:
+        prefix = " " if cleaned_ids else ""
+        line.append({"tag": "text", "text": f"{prefix}{text}", "style": ["italic", "bold"]})
     return line
 
 
 def build_post_zh_cn_from_sections(*, title: str, date_label: str, today_items: list[dict], week_items: list[dict]) -> dict:
     """
     根据两块内容拼装 zh_cn：
-    - date_label 任务：today_items = [{"user_id": "ou_xxx", "text": "项目 - 任务 - 状态"}, ...]
+    - date_label 任务：today_items = [{"user_ids": ["ou_xxx", "ou_yyy"], "text": "项目 - 任务 - 状态"}, ...]
     - 本周任务：week_items 同上（为空则不渲染本周标题）
     返回 zh_cn dict，可直接传给 send_post_zh_cn。
     """
@@ -224,18 +228,22 @@ def build_post_zh_cn_from_sections(*, title: str, date_label: str, today_items: 
     content_blocks.append([{ "tag": "text", "text": f"{date_label}任务:", "style": ["bold"] }])
     if today_items:
         for item in today_items:
-            uid = (item or {}).get("user_id")
+            user_ids = list((item or {}).get("user_ids") or [])
             txt = (item or {}).get("text", "")
-            if uid:
-                content_blocks.append(_make_task_line(uid, txt))
+            if user_ids:
+                content_blocks.append(_make_task_line(user_ids, txt))
+            else:
+                content_blocks.append(_make_task_line([], txt))
     # 第二块：本周任务（若有）
     if week_items:
         content_blocks.append([{ "tag": "text", "text": "本周任务:", "style": ["bold"] }])
         for item in week_items:
-            uid = (item or {}).get("user_id")
+            user_ids = list((item or {}).get("user_ids") or [])
             txt = (item or {}).get("text", "")
-            if uid:
-                content_blocks.append(_make_task_line(uid, txt))
+            if user_ids:
+                content_blocks.append(_make_task_line(user_ids, txt))
+            else:
+                content_blocks.append(_make_task_line([], txt))
 
     return {"title": title, "content": content_blocks}
 
@@ -271,25 +279,38 @@ def send_post_from_summary_text(summary_text: str, *, title: str = "任务汇总
         if ln.startswith("(") and ")" in ln:
             ln = ln.split(")", 1)[1].strip()  # split(")", 1)：第二个参数表示最多分割 1 次，返回 2 个部分，这里取 [1] 即右括号后的内容
         parts = [p.strip() for p in ln.replace("，", ",").split(",") if p.strip()]
-        user_id = ""
-        rest = ""
+        user_ids: list[str] = []
+        rest_parts: list[str] = []
         if parts:
-            first = parts[0]
-            user_id = first[1:] if first.startswith("@") else first
-            rest = ", ".join(parts[1:]) if len(parts) > 1 else ""
-        return user_id, rest
+            for idx, part in enumerate(parts):
+                token = part.strip()
+                if token.startswith("@"):
+                    candidate = token[1:].strip()
+                    if candidate:
+                        user_ids.append(candidate)
+                    continue
+                if idx == 0 and token.startswith("ou_") and not user_ids:
+                    user_ids.append(token)
+                    continue
+                if idx == 0 and not user_ids:
+                    # 兼容旧格式：首段视为 user_id
+                    user_ids.append(token[1:] if token.startswith("@") else token)
+                    continue
+                rest_parts.append(token)
+        rest = ", ".join(rest_parts)
+        # 去除空 user_id
+        user_ids = [uid for uid in user_ids if uid]
+        return user_ids, rest
 
     date_label, today_raw, week_raw = parse_sections(summary_text)
     today_items = []
     for ln in today_raw:
-        uid, txt = parse_task_line(ln)
-        if uid:
-            today_items.append({"user_id": uid, "text": txt})
+        user_ids, txt = parse_task_line(ln)
+        today_items.append({"user_ids": user_ids, "text": txt})
     week_items = []
     for ln in week_raw:
-        uid, txt = parse_task_line(ln)
-        if uid:
-            week_items.append({"user_id": uid, "text": txt})
+        user_ids, txt = parse_task_line(ln)
+        week_items.append({"user_ids": user_ids, "text": txt})
 
     zh_cn = build_post_zh_cn_from_sections(title=title, date_label=date_label, today_items=today_items, week_items=week_items)
     return send_post_zh_cn(zh_cn, receive_id=receive_id, receive_id_type=receive_id_type)
