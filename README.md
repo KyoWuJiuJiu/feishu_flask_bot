@@ -1,108 +1,138 @@
 # Feishu Flask Bot
 
-A small Flask service that receives summary payloads from a front-end and forwards them to Feishu group chats as rich text posts. It wraps Feishu tenant token management, message formatting, and per-audience routing behind a single REST endpoint.
+A small Flask service that receives front‑end requests and either:
+- Sends rich‑text messages to Feishu group chats, or
+- Triggers an Anycross (集成流) webhook to sync tasks.
+
+The service runs behind Nginx with HTTPS. Slow upstream webhook responses are treated as accepted (非阻塞语义)：API 立即返回 202，前端用 jobId 轮询状态。
 
 ## Prerequisites
 
 - Python 3.10+
-- Feishu developer app with permissions to send group messages
-- Chat IDs for the target Feishu groups (PD / OPS or any chat you plan to notify)
+- Feishu developer app with group messaging permission
+- Target Feishu chat IDs (PD / OPS)
+- Windows + Nginx (HTTPS 9876) with a certificate whose SAN includes the IP 192.168.0.96
 
-## Getting Started
+## Setup
 
-1. Clone the repository and create a virtual environment (optional but recommended).
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate  # Windows: venv\\Scripts\\activate
-   pip install -r requirements.txt
-   ```
-2. Create a `.env` file in the project root with your Feishu credentials. **Do not commit secrets.**
-   ```env
-   APP_ID=cli_xxxxxxxxxxxxxxxx
-   APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-   CHAT_ID=oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # optional default group
-   PD_CHAT_ID=oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # used when request payload sets "pd": true
-   OPS_CHAT_ID=oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxx  # used when request payload sets "ops": true
-   ```
-3. Run the Flask app.
-   ```bash
-   python app.py
-   ```
-   The server listens on `http://localhost:8000` by default.
+1) Install dependencies
+```
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+2) Configure environment (`.env` in project root)
+```
+APP_ID=cli_xxxxxxxxxxxxxxxx
+APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+CHAT_ID=oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # optional
+PD_CHAT_ID=oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxx # used when body.pd = true
+OPS_CHAT_ID=oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxx # used when body.ops = true
+```
+
+3) Run backend (Waitress)
+```
+.\venv\Scripts\python.exe serve.py
+```
+- Binds to `http://127.0.0.1:9876` (loopback)
+- Exposed externally by Nginx: `https://192.168.0.96:9876`
+
+## Nginx + HTTPS
+
+- External listener: `listen 192.168.0.96:9876 ssl;`
+- Upstream proxy: `proxy_pass http://127.0.0.1:9876;`
+- Health endpoint (recommended):
+```
+location /healthz { access_log off; default_type application/json; return 200 '{"status":"ok"}'; }
+```
+- Certificate must include SAN iPAddress=192.168.0.96. For self‑signed/internal CA, client machines must import the root cert to trust it.
 
 ## API Reference
 
-### `POST /api/endpoint`
+### POST `/api/endpoint`
+- Purpose: Accept a summary text and send Feishu rich‑text posts to PD/OPS.
+- Body
+```
+{ "summaryText": "今日任务:\n@ou_xxx, 项目, 任务, 状态", "pd": true, "ops": false }
+```
+- Success
+```
+{ "status": "success", "targets": ["oc_xxx", "oc_yyy"] }
+```
 
-- **Purpose**: Accepts a plain-text summary and delivers it to Feishu chats as a rich-text `post` message.
-- **Request body**
-  ```json
-  {
-    "summaryText": "今日任务:\n(第1条) @ou_xxx, 项目名称, 任务名称, 状态\n本周任务:\n@ou_yyy, 项目, 任务, 状态",
-    "pd": true,
-    "ops": false
-  }
-  ```
-  - `summaryText` (required): Text containing two sections labeled `…任务:`. The service parses each line, extracts user IDs (with or without `@`), and formats them into Feishu checkbox lines.
-  - `pd` / `ops` (optional booleans): Toggle whether to push the message to the PD / OPS chat IDs. You can add more branches by editing `app.py`.
-- **Success response**
-  ```json
-  {
-    "status": "success",
-    "message": "已发送到目标群",
-    "targets": ["oc_xxx", "oc_yyy"]
-  }
-  ```
-- **Error responses**: Standardized JSON with `status="error"` and a descriptive `message` (e.g., missing env vars, empty summary, Feishu API failure).
+### POST `/api/task-sync`
+- Purpose: Trigger Anycross webhook to sync tasks.
+- Single record
+```
+{ "webhookUrl": "https://open.feishu.cn/anycross/trigger/callback/xxx", "recordId": "ROW-001", "timeout": 15 }
+```
+- Batch (recommended even for 1 record)
+```
+{ "webhookUrl": "https://open.feishu.cn/anycross/trigger/callback/xxx", "records": ["ROW-001"], "timeout": 15 }
+```
+- Behavior
+  - Batch: returns `202` with `jobId` immediately; poll status API for result.
+  - Single: waits up to `timeout` seconds; if upstream read‑timeout occurs, treated as accepted and you can poll status later.
 
-## Feishu Integration
+### GET `/api/task-sync/status/<jobId>`
+- Returns `{ status, results, createdAt/updatedAt/completedAt }`, where `status` ∈ {`success`,`error`,`partial`,`accepted`}.
 
-- `feishu.py` centralizes token fetching (`tenant_access_token`) with simple in-process caching, plus helpers for sending plain text and rich-text posts.
-- The message payload is serialized to the `post` schema required by Feishu (`content` must be a JSON string).
-- `curl.md` documents manual API calls if you need to debug without the Flask layer.
+## Testing (Windows PowerShell)
+
+- Message endpoint
+```
+C:\Windows\System32\curl.exe -i https://192.168.0.96:9876/api/endpoint ^
+  -H "Content-Type: application/json" ^
+  --data-raw '{ "summaryText": "今日任务:\n@ou_demo, 项目, 任务, 状态", "pd": true, "ops": false }'
+```
+
+- Task sync (batch → 202 → poll)
+```
+$payload = @{ webhookUrl = 'https://open.feishu.cn/anycross/trigger/callback/xxxx'; records = @('ROW-001'); timeout = 15 } | ConvertTo-Json -Compress
+$resp = Invoke-RestMethod https://192.168.0.96:9876/api/task-sync -Method Post -Body $payload -ContentType 'application/json'
+do { $s = Invoke-RestMethod "https://192.168.0.96:9876/api/task-sync/status/$($resp.jobId)"; $s | ConvertTo-Json -Depth 6; Start-Sleep 2 } while ($s.status -notin @('success','error','partial','accepted'))
+```
+
+## Behavior & Env Switches
+
+- Feishu HTTP timeout: `_HTTP_TIMEOUT` in `feishu.py` (default 10s).
+- Anycross read‑timeout is treated as `accepted` (async). Front‑end should poll status with `jobId`.
+- SSL troubleshooting (optional):
+  - `ANYCROSS_VERIFY_SSL=false` (dev only) → disable verification.
+  - `ANYCROSS_CA_BUNDLE=C:\path\to\corp-root-ca.pem` → custom CA bundle for strict verification.
 
 ## Project Structure
-
 ```
-app.py              # Flask entry point exposing /api/endpoint
-feishu.py           # Feishu SDK helpers: token cache, rich-text builders, senders
-get_token.py        # Standalone script to fetch a tenant token for debugging
-curl.md             # Step-by-step curl examples
-requirements.txt    # Python dependencies
+app.py               # Flask app (endpoints)
+feishu.py            # Feishu helpers
+serve.py             # Waitress entry (127.0.0.1:9876, threads=16)
+requirements.txt     # Dependencies
+scripts/start_bot.ps1
+scripts/start_nginx.ps1
 ```
 
-Additional utilities (`test.py`, `test_post.py`) provide quick manual experiments for message formatting.
+## Auto Start on Boot (Windows)
 
-## Development Notes
+Scripts provided and scheduled tasks registered:
+- `FeishuFlaskBot`: runs `scripts/start_bot.ps1`
+- `NginxStart`: runs `scripts/start_nginx.ps1`
 
-- CORS is enabled for Vite dev servers on `localhost:5173` and `127.0.0.1:5173`. Update origins in `app.py` if your front-end runs elsewhere.
-- When adding new audiences beyond PD/OPS, extend the boolean flag handling in `app.py` and populate matching chat IDs in the environment.
-- The Feishu HTTP timeout defaults to 10 seconds; adjust `_HTTP_TIMEOUT` in `feishu.py` if your network requires longer waits.
-
-## Testing
-
-- Manually POST to the endpoint while the server is running:
-  ```bash
-  curl -X POST http://localhost:8000/api/endpoint \
-    -H 'Content-Type: application/json' \
-    -d '{"summaryText":"今日任务:\\n@ou_demo, 项目, 任务, 状态","pd":true}'
-  ```
-- Check Feishu group chats to confirm the message layout. For lower-level diagnostics, run the scripts in `curl.md` or `test.py` with disposable tokens.
+Manage tasks
+```
+schtasks /Run /TN FeishuFlaskBot
+schtasks /Run /TN NginxStart
+schtasks /Query /TN FeishuFlaskBot /V /FO LIST
+schtasks /Delete /TN FeishuFlaskBot /F
+```
 
 ## Troubleshooting
 
-- **401 or auth errors**: Ensure `APP_ID` and `APP_SECRET` are valid and that you are using a fresh tenant access token.
-- **"缺少 PD_CHAT_ID 环境变量"**: Set the corresponding chat ID or disable the flag in the request body.
-- **No message delivered**: The service silently succeeds when both `pd` and `ops` are `false`; verify your front-end toggles.
+- 401/auth: verify `APP_ID` / `APP_SECRET`.
+- Missing chat IDs: set `PD_CHAT_ID` / `OPS_CHAT_ID` or disable flags in body.
+- Task‑sync slow/504: use batch (202 + poll). Only when you must wait synchronously, increase request `timeout` and optionally Nginx `proxy_read_timeout`.
+- Logs: app `logs/app.log`; Nginx `C:\nginx\logs\access.log`, `error.log`.
 
-## License
-
-Specify your project license here (e.g., MIT, Apache-2.0) if you plan to share the code. Update this section accordingly.
-
-## 部署环境接口
-
-- 发送消息：`http://122.227.179.126:9876/api/endpoint`
-- 同步任务触发：`http://122.227.179.126:9876/api/task-sync`
-- 同步任务状态查询：`http://122.227.179.126:9876/api/task-sync/status/<job_id>`
-
-以上为 windows 服务器 Waitress 实例直接对外暴露的地址。如后续接入 NGINX/IIS 反向代理，请根据新域名/端口更新。
+## Runtime Endpoints (current env)
+- Send message: `https://192.168.0.96:9876/api/endpoint`
+- Trigger sync: `https://192.168.0.96:9876/api/task-sync`
+- Query status: `https://192.168.0.96:9876/api/task-sync/status/<job_id>`
