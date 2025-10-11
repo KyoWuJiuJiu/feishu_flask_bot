@@ -9,6 +9,7 @@ import uuid
 from typing import Any, Dict, List, Tuple
 
 import requests
+import os
 
 
 logger = logging.getLogger(__name__)
@@ -44,8 +45,28 @@ def trigger_anycross_webhook(
     if not webhook_url:
         raise AnycrossTriggerError("webhook_url is required")
 
+    # SSL verification behavior can be controlled via env:
+    # - ANYCROSS_CA_BUNDLE: path to a PEM bundle (used as verify argument)
+    # - ANYCROSS_VERIFY_SSL: set to "false"/"0"/"no" to disable verification (DEV only)
+    verify_opt: bool | str = True
+    ca_bundle = os.getenv("ANYCROSS_CA_BUNDLE")
+    if ca_bundle:
+        verify_opt = ca_bundle
+    else:
+        verify_flag = (os.getenv("ANYCROSS_VERIFY_SSL", "true").strip().lower())
+        if verify_flag in ("0", "false", "no"):
+            verify_opt = False
+
     try:
-        response = requests.post(webhook_url, json=payload, timeout=timeout)
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            timeout=timeout,
+            verify=verify_opt,
+        )
+    except requests.exceptions.ReadTimeout as exc:
+        # Upstream未在超时内返回，视为已接受（异步执行中），交由轮询确认最终状态
+        raise AnycrossInvokeTimeout(f"Read timeout after {timeout}s") from exc
     except requests.RequestException as exc:  # network or SSL failure
         raise AnycrossTriggerError(f"Network error: {exc}") from exc
 
