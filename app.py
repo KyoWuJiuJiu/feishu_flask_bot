@@ -8,7 +8,8 @@ from typing import Any
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-from feishu import send_post_from_summary_text
+from feishu import send_post_from_summary_text, _parse_task_line_multi, build_post_zh_cn_from_sections
+import feishu as _feishu_mod
 from task_sync_service import (
     AnycrossInvokeTimeout,
     AnycrossTriggerError,
@@ -42,6 +43,7 @@ def configure_logging() -> None:
 configure_logging()
 
 app = Flask(__name__)
+getLogger(__name__).info("Using feishu module at: %s", getattr(_feishu_mod, "__file__", "<unknown>"))
 
 # Enable CORS for Vite dev server origins; allow POST and the automatic OPTIONS preflight with Content-Type header
 CORS(app, resources={
@@ -70,6 +72,7 @@ def handle_summary():
 
     pd_flag = data.get("pd") is True
     ops_flag = data.get("ops") is True
+    dry_run = data.get("dryRun") is True
 
     pd_chat = os.getenv("PD_CHAT_ID")
     ops_chat = os.getenv("OPS_CHAT_ID")
@@ -83,6 +86,27 @@ def handle_summary():
         if not ops_chat:
             return jsonify(status="error", message="Missing OPS_CHAT_ID environment variable"), 500
         targets.append(ops_chat)
+
+    # In dryRun mode, parse and return the zh_cn payload without sending to Feishu
+    if dry_run:
+        def parse_sections_generic(text: str):
+            # 简化逻辑：凡是以 '@' 开头的行都视为“今日任务”的条目；其余行忽略
+            lines = [ln.rstrip() for ln in (text or "").splitlines() if ln.strip()]
+            date_label = "今日"
+            today_lines = [ln.strip() for ln in lines if ln.lstrip().startswith("@")]
+            return date_label, today_lines, []
+
+        date_label, today_raw, week_raw = parse_sections_generic(summary)
+        today_items = []
+        for ln in today_raw:
+            uids, txt = _parse_task_line_multi(ln)
+            today_items.append({"user_ids": uids, "text": txt})
+        week_items = []
+        for ln in week_raw:
+            uids, txt = _parse_task_line_multi(ln)
+            week_items.append({"user_ids": uids, "text": txt})
+        zh_cn = build_post_zh_cn_from_sections(title="调试", date_label=date_label, today_items=today_items, week_items=week_items)
+        return jsonify(status="ok", dateLabel=date_label, today=today_items, week=week_items, zh_cn=zh_cn)
 
     if not targets:
         # Both toggles disabled -> nothing to send.
@@ -164,6 +188,39 @@ def get_task_sync_job(job_id: str):
         # remove completed job from cache on final states
         get_job_status(job_id, pop=True)
     return jsonify(response)
+
+
+@app.route("/api/debug/parse", methods=["POST"])
+def debug_parse():
+    data = request.get_json(silent=True) or {}
+    summary_text = (data.get("summaryText") or "").strip()
+    if not summary_text:
+        return jsonify(status="error", message="Missing summaryText"), 400
+
+    def parse_sections_generic(text: str):
+        # 简化：仅收集以 '@' 开头的行
+        lines = [ln.rstrip() for ln in (text or "").splitlines() if ln.strip()]
+        date_label = "今日"
+        today_lines = [ln.strip() for ln in lines if ln.lstrip().startswith("@")]
+        return date_label, today_lines, []
+
+    date_label, today_raw, week_raw = parse_sections_generic(summary_text)
+    today_items = []
+    for ln in today_raw:
+        uids, txt = _parse_task_line_multi(ln)
+        today_items.append({"user_ids": uids, "text": txt, "raw": ln})
+    week_items = []
+    for ln in week_raw:
+        uids, txt = _parse_task_line_multi(ln)
+        week_items.append({"user_ids": uids, "text": txt, "raw": ln})
+
+    zh_cn = build_post_zh_cn_from_sections(
+        title="调试",
+        date_label=date_label,
+        today_items=[{"user_ids": it["user_ids"], "text": it["text"]} for it in today_items],
+        week_items=[{"user_ids": it["user_ids"], "text": it["text"]} for it in week_items],
+    )
+    return jsonify(status="ok", dateLabel=date_label, today=today_items, week=week_items, zh_cn=zh_cn)
 
 
 if __name__ == "__main__":

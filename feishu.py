@@ -22,6 +22,7 @@ import json
 import time
 from dotenv import load_dotenv
 import os
+import re
 
 # Load environment variables from .env (placed in project root)
 load_dotenv()
@@ -46,6 +47,33 @@ _token_expiration_time = None  # 缓存过期时间（epoch 秒）；同样只�
 
 # Default HTTP timeout (seconds) for Feishu API calls
 _HTTP_TIMEOUT = 10
+
+def _shrink_to_task_status_v2(text: str) -> str:
+    """Split by wide set of separators and keep the last two segments (task, status).
+    Separators: whitespace, ',', '，', '、', ';', '；', '·', '—', '-'
+    """
+    if not isinstance(text, str):
+        return text
+    import re as _re
+    parts = [p.strip() for p in _re.split(r"[\s,\uFF0C\u3001;\uFF1B·\u2014\-]+", text) if p.strip()]
+    if len(parts) >= 2:
+        return ", ".join(parts[-2:])
+    return text.strip()
+
+def _shrink_to_task_status(text: str) -> str:
+    """Keep only the last two segments (task, status) from a comma-like separated text.
+    Normalizes Chinese separators first. If segments < 2, returns original.
+    """
+    if not isinstance(text, str):
+        return text
+    normalized = text.replace("、", ",").replace("，", ",")
+    parts = [p.strip() for p in normalized.split(",") if p.strip()]
+    if len(parts) >= 2:
+        return ", ".join(parts[-2:])
+    return text.strip()
+
+# Feature flag (default on): strip project name from the text part, keep only task + status
+_STRIP_PROJECT = (os.getenv("STRIP_PROJECT_FROM_TEXT", "true").strip().lower() in ("1", "true", "yes", "on"))
 
 def get_tenant_access_token():
     global _cached_token, _token_expiration_time  # 使用全局变量的规则：
@@ -211,9 +239,43 @@ def _make_task_line(user_ids: list[str], text: str) -> list[dict]:
         if idx < len(cleaned_ids) - 1:
             line.append({"tag": "text", "text": " ", "style": ["italic"]})
     if text:
+        try:
+            # If feature flag is on, shrink text to only task + status
+            if _STRIP_PROJECT:
+                text = _shrink_to_task_status_v2(text)
+        except NameError:
+            pass
         prefix = " " if cleaned_ids else ""
         line.append({"tag": "text", "text": f"{prefix}{text}", "style": ["italic", "bold"]})
     return line
+
+
+def _parse_task_line_multi(ln: str) -> tuple[list[str], str]:
+    # 去掉前缀（第N条）
+    if ln.startswith("(") and ")" in ln:
+        ln = ln.split(")", 1)[1].strip()
+    # 统一分隔符
+    text = ln.replace("、", ",").replace("，", ",")
+    # 提取所有 @ou_xxx 或裸 ou_xxx（只取开头连续出现的 id 更稳妥）
+    user_ids: list[str] = []
+    # 先找所有 @ou_*
+    for m in re.findall(r"@ou_[A-Za-z0-9]+", text):
+        user_ids.append(m[1:])
+    # 若没有 @ 前缀，尝试在开头捕获裸 ou_*
+    if not user_ids:
+        m = re.match(r"\s*(ou_[A-Za-z0-9]+(?:\s+ou_[A-Za-z0-9]+)*)", text)
+        if m:
+            for tok in m.group(1).split():
+                if tok.startswith("ou_"):
+                    user_ids.append(tok)
+    # 去掉这些 id 与多余分隔，得到其余描述
+    rest = text
+    for uid in user_ids:
+        rest = rest.replace("@" + uid, " ")
+        rest = rest.replace(uid, " ")
+    rest = rest.lstrip(", ")
+    rest = re.sub(r"\s+", " ", rest).strip()
+    return user_ids, rest
 
 
 def build_post_zh_cn_from_sections(*, title: str, date_label: str, today_items: list[dict], week_items: list[dict]) -> dict:
@@ -230,20 +292,22 @@ def build_post_zh_cn_from_sections(*, title: str, date_label: str, today_items: 
         for item in today_items:
             user_ids = list((item or {}).get("user_ids") or [])
             txt = (item or {}).get("text", "")
+            display_txt = _shrink_to_task_status_v2(txt) if _STRIP_PROJECT else txt
             if user_ids:
-                content_blocks.append(_make_task_line(user_ids, txt))
+                content_blocks.append(_make_task_line(user_ids, display_txt))
             else:
-                content_blocks.append(_make_task_line([], txt))
+                content_blocks.append(_make_task_line([], display_txt))
     # 第二块：本周任务（若有）
     if week_items:
         content_blocks.append([{ "tag": "text", "text": "本周任务:", "style": ["bold"] }])
         for item in week_items:
             user_ids = list((item or {}).get("user_ids") or [])
             txt = (item or {}).get("text", "")
+            display_txt = _shrink_to_task_status_v2(txt) if _STRIP_PROJECT else txt
             if user_ids:
-                content_blocks.append(_make_task_line(user_ids, txt))
+                content_blocks.append(_make_task_line(user_ids, display_txt))
             else:
-                content_blocks.append(_make_task_line([], txt))
+                content_blocks.append(_make_task_line([], display_txt))
 
     return {"title": title, "content": content_blocks}
 
@@ -305,11 +369,11 @@ def send_post_from_summary_text(summary_text: str, *, title: str = "任务汇总
     date_label, today_raw, week_raw = parse_sections(summary_text)
     today_items = []
     for ln in today_raw:
-        user_ids, txt = parse_task_line(ln)
+        user_ids, txt = _parse_task_line_multi(ln)
         today_items.append({"user_ids": user_ids, "text": txt})
     week_items = []
     for ln in week_raw:
-        user_ids, txt = parse_task_line(ln)
+        user_ids, txt = _parse_task_line_multi(ln)
         week_items.append({"user_ids": user_ids, "text": txt})
 
     zh_cn = build_post_zh_cn_from_sections(title=title, date_label=date_label, today_items=today_items, week_items=week_items)
