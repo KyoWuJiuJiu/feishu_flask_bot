@@ -48,12 +48,38 @@ getLogger(__name__).info("Using feishu module at: %s", getattr(_feishu_mod, "__f
 # Enable CORS for Vite dev server origins; allow POST and the automatic OPTIONS preflight with Content-Type header
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["http://localhost:5173", "http://127.0.0.1:5173"],
+        "origins": [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "https://paramont.feishu.cn",
+            "https://ext.baseopendev.com",
+        ],
         "methods": ["POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "X-Requested-With", "Accept"],
         "max_age": 86400,
     }
 })
+
+
+@app.after_request
+def _add_cors_headers(resp):
+    try:
+        origin = request.headers.get("Origin", "")
+        allowed = {
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "https://paramont.feishu.cn",
+            "https://ext.baseopendev.com",
+        }
+        if origin in allowed and request.path.startswith("/api/"):
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Requested-With, Accept"
+            resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+            resp.headers["Access-Control-Max-Age"] = "86400"
+    except Exception:
+        pass
+    return resp
 
 
 @app.route("/api/endpoint", methods=["POST", "OPTIONS"])
